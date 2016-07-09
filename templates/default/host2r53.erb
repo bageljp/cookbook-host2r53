@@ -1,0 +1,119 @@
+#!/bin/bash
+#
+# Startup script for the tomcat
+#
+# chkconfig: 345 60 10
+# description: Hostname register / de-register to Route53.
+
+# define
+export domain="${0#*_}"
+export TTL="300"
+export LOG_TAG="host2r53"
+export SUBSYS_LOCK="/var/lock/subsys/host2r53_${domain}"
+export AWS_DEFAULT_REGION="ap-northeast-1"
+export CMD_AWS="/usr/bin/aws"
+export CMD_JQ="/usr/bin/jq"
+export instance_id=$(wget -q -O - http://169.254.169.254/latest/meta-data/instance-id)
+export tag_name=$(${CMD_AWS} ec2 --output text --region ${AWS_DEFAULT_REGION} describe-tags --filters "Name=resource-id,Values=${instance_id}" "Name=key,Values=Name" --query "Tags[*].Value")
+export public_ipv4=$(wget -q -O - http://169.254.169.254/latest/meta-data/public-ipv4)
+export hostzone_id=$(${CMD_AWS} route53 list-hosted-zones | ${CMD_JQ} ".HostedZones[] | select(.Name == \""${domain}.\"").Id" | sed -e 's/\"//g' | awk -F/ '{print $NF}')
+
+# function
+func_usage() {
+    echo "Usage: $(basename $0) {start|stop|restart|status}"
+    return 0
+}
+
+start() {
+    ${CMD_AWS} route53 change-resource-record-sets --hosted-zone-id ${hostzone_id} --change-batch "{
+        \""Comment\"": \""string\"",
+            \""Changes\"": [
+                {
+                    \""Action\"": \""UPSERT\"",
+                    \""ResourceRecordSet\"": {
+                        \""Name\"": \""${tag_name}.${domain}\"",
+                        \""Type\"": \""A\"",
+                        \""TTL\"": ${TTL},
+                        \""ResourceRecords\"": [
+                            {
+                                \""Value\"": \""${public_ipv4}\""
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"
+
+    ret=$?
+
+    if [ ${ret} -eq 0 ]; then
+        logger -p user.info -t ${LOG_TAG} "Hostname register to Route53 succeeded. rrset is [${tag_name}.${domain}  A  ${TTL}  ${public_ipv4}]."
+    else
+        logger -p user.error -t ${LOG_TAG} "Hostname register to Route53 failed. rrset is [${tag_name}.${domain}  A  ${TTL}  ${public_ipv4}]."
+    fi
+    touch ${SUBSYS_LOCK}
+    return ${ret}
+}
+
+stop() {
+    ${CMD_AWS} route53 change-resource-record-sets --hosted-zone-id ${hostzone_id} --change-batch "{
+        \""Comment\"": \""string\"",
+            \""Changes\"": [
+                {
+                    \""Action\"": \""DELETE\"",
+                    \""ResourceRecordSet\"": {
+                        \""Name\"": \""${tag_name}.${domain}\"",
+                        \""Type\"": \""A\"",
+                        \""TTL\"": ${TTL},
+                        \""ResourceRecords\"": [
+                            {
+                                \""Value\"": \""${public_ipv4}\""
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"
+
+    ret=$?
+
+    if [ ${ret} -eq 0 ]; then
+        logger -p user.info -t ${LOG_TAG} "Hostname de-register to Route53 succeeded. rrset is [${tag_name}.${domain}  A  ${TTL}  ${public_ipv4}]."
+    else
+        logger -p user.error -t ${LOG_TAG} "Hostname de-register to Route53 failed. rrset is [${tag_name}.${domain}  A  ${TTL}  ${public_ipv4}]."
+    fi
+    rm -f ${SUBSYS_LOCK}
+    return ${ret}
+}
+
+status() {
+    ${CMD_AWS} route53 list-resource-record-sets --hosted-zone-id ${hostzone_id} | ${CMD_JQ} ".ResourceRecordSets[] | select(.Name == \""${tag_name}.${domain}.\"")"
+
+    return $?
+}
+
+# main
+case "$1" in
+  start)
+        start
+        ret=$?
+        ;;
+  stop)
+        stop
+        ret=$?
+        ;;
+  restart)
+        stop
+        start
+        ret=$?
+        ;;
+  status)
+        status
+        ret=$?
+        ;;
+  *)
+        func_usage
+        ret=1
+esac
+
+exit ${ret}
